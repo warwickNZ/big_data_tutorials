@@ -16,7 +16,7 @@ HDFS 是 Hadoop 生态中的分布式文件系统，目标是为大规模数据�
 
 HDFS 的基本取舍是：
 
-> 用较高的吞吐和容错能力，换取对低延迟随机写、频繁小文件和复杂事务的支持。
+> 以较高吞吐和容错能力为目标，但会牺牲低延迟随机写、频繁小文件和复杂事务能力。
 
 它更像一个“分布式文件系统”，而不是数据库、消息队列或缓存。
 
@@ -111,7 +111,7 @@ flowchart TB
 | HDFS Client | 访问命名空间，并按 NameNode 返回的位置直接访问 DataNode | 不需要让所有数据经过 NameNode |
 | SecondaryNameNode | 定期合并 FsImage 和 EditLog，生成检查点 | 不是 Standby NameNode，不能直接接管故障 |
 
-在配置了 NameNode HA 的集群中，通常由 Standby NameNode 持续同步并执行检查点，SecondaryNameNode 不再承担 HA 接管角色；是否部署 SecondaryNameNode 还要以具体 Hadoop 版本和发行版的部署方案为准。
+在标准 Hadoop 3.x HA 架构中，Standby NameNode 负责持续同步 EditLog 并定期执行 checkpoint，因此通常不需要部署 SecondaryNameNode。SecondaryNameNode 主要用于非 HA 架构；具体仍应以目标发行版的部署方案为准。
 
 ### 2.3 NameNode：元数据管理者
 
@@ -294,7 +294,7 @@ HDFS 不是关系数据库事务系统。写入过程中，文件可能处于正
 对于需要让其他读取者看到已写入数据的场景，可使用客户端 API 提供的 `hflush` 或 `hsync` 语义：
 
 - `hflush`：把客户端缓冲区中的数据刷新到写入链路，并使新读取者可以看到已刷新内容；它不等同于底层磁盘已经完成持久化。
-- `hsync`：除刷新数据外，还请求同步相关元数据和底层存储状态，语义更接近文件系统的 `fsync`；实际持久性仍受 Hadoop 版本、底层文件系统和存储设备影响。
+- `hsync`：除刷新数据外，还请求将数据同步到持久化存储，语义更接近文件系统的 `fsync`。若希望其他读取者看到正在写入文件的最新长度，需在 HDFS 特定 API 中使用 `SyncFlag.UPDATE_LENGTH`；不能默认认为文件长度等 NameNode 元数据一定会同步。实际持久性仍受 Hadoop 版本、底层文件系统和存储设备影响。
 
 二者都不是数据库事务，也不提供跨文件原子提交。不能把客户端收到普通写入响应简单理解为“数据已经永久落盘”。
 
@@ -427,7 +427,7 @@ Router-based Federation（RBF）在客户端和多个 namespace 之间增加 Rou
 
 ### 8.3 Observer NameNode
 
-Observer NameNode 保存接近最新的 namespace 状态，并可在特定读语义下分担读请求，降低 Active NameNode 的元数据读压力。它不能接收写操作，也不应被误解为普通 DataNode 或独立存储节点。
+Observer NameNode 保存接近最新的 namespace 状态，并可在特定读语义下分担读请求，降低 Active NameNode 的元数据读压力。普通客户端不会自动使用 Observer，需要配置 `ObserverReadProxyProvider` 等相应的客户端路由；客户端状态 ID 可用于保证读请求不会落后于自身依赖的元数据进度，Observer 未追上时可能等待或按客户端策略回退到 Active。它不能接收写操作，也不应被误解为普通 DataNode 或独立存储节点。
 
 ## 9. 容错与故障处理
 
@@ -451,14 +451,14 @@ NameNode 将 DataNode 标记为不可用
 
 ### 9.2 磁盘故障
 
-DataNode 可以配置多个存储目录。单块磁盘损坏时，DataNode 通常隔离该目录并继续使用其他目录；损坏 Block 的副本由集群后续补齐。
+DataNode 可以配置多个存储目录。单块磁盘损坏后，DataNode 是否继续服务取决于 `dfs.datanode.failed.volumes.tolerated`：默认值为 `0` 时，卷故障即可使 DataNode 停止服务；只有配置了可容忍的故障卷数且仍有可用卷时，DataNode 才能隔离故障目录并继续使用其他目录。损坏 Block 的副本由集群后续补齐。
 
 ### 9.3 NameNode 故障
 
 - 非 HA：元数据服务中断，需要人工恢复或启动备用节点。
 - HA：Standby 在完成 fencing 和切换后接管 namespace 服务。
 
-无论是否 HA，都需要备份 FsImage、EditLog 或定期通过 DistCp 等方式保留关键数据副本。HA 主要解决在线可用性，不等于防误删、勒索、全站故障和长期归档。
+无论是否 HA，都应分层保护：备份 FsImage 和 EditLog 以恢复 NameNode 元数据；通过 DistCp、跨集群复制或其他备份方案保留关键用户数据副本。HA 主要解决在线可用性，不等于防误删、勒索、全站故障和长期归档。
 
 ### 9.4 数据损坏
 
@@ -497,7 +497,7 @@ Safe Mode 不是“修复数据”的命令，也不是遇到写失败就应该�
 
 ### 11.1 水平扩展
 
-增加 DataNode 和磁盘即可扩展总容量与吞吐。计算框架也可以随节点增加而扩展并行度。
+增加 DataNode 和磁盘通常可以扩展总容量及数据读写吞吐，计算框架也可以随节点增加而扩展并行度；但单个 namespace 的元数据吞吐仍受 NameNode 能力限制，需要通过 Observer 分担读请求或用 Federation 拆分 namespace。
 
 ### 11.2 高吞吐
 
@@ -527,7 +527,7 @@ HDFS 面向吞吐和文件扫描，不是为毫秒级单行查询设计。小范
 
 ### 12.3 不适合频繁随机更新
 
-文件通常写完后读取，频繁修改文件中间内容会带来较大代价。列式表格式的更新、删除和合并通常由 Hive、Iceberg、Hudi、Delta Lake 等上层系统负责。
+文件通常写完后读取，频繁修改文件中间内容会带来较大代价。数据湖表的更新、删除和合并通常由 Hive ACID、Iceberg、Hudi、Delta Lake 等上层表系统负责，底层数据文件常使用 Parquet 或 ORC 等列式格式。
 
 ### 12.4 运维复杂
 
@@ -726,7 +726,7 @@ Block 大小、副本因子和压缩格式需要结合：
 
 还要为副本重建、滚动升级、磁盘故障和临时文件预留空间。集群接近满盘时，写入、均衡和副本恢复都会变得困难。
 
-HDFS Balancer 用于在 DataNode 或存储类型之间重新分布 Block，使磁盘利用率更均衡。它通常会产生额外的网络和磁盘 I/O，应在业务低峰期执行，并设置合适的带宽、阈值和并发限制。Balancer 解决的是容量分布不均，不是小文件治理，也不是副本修复工具。
+HDFS Balancer 用于在 DataNode 之间重新分布 Block，使集群容量利用率更均衡。存储类型策略的迁移由 Mover 或 Storage Policy Satisfier 处理；单个 DataNode 内各磁盘卷的均衡由 DiskBalancer 处理。Balancer 通常会产生额外的网络和磁盘 I/O，应在业务低峰期执行，并设置合适的带宽、阈值和并发限制。它解决的是容量分布不均，不是小文件治理，也不是副本修复工具。
 
 ### 16.2 小文件治理
 
@@ -738,6 +738,7 @@ HDFS Balancer 用于在 DataNode 或存储类型之间重新分布 Block，使�
 
 - NameNode heap、GC、RPC 延迟、namespace 对象数量
 - Active/Standby 同步延迟和 JournalNode 状态
+- Observer 的 EditLog 追赶延迟、读请求回退到 Active 的次数和等待超时
 - DataNode 在线数、磁盘使用率、坏盘目录
 - Under-replicated、corrupt、missing Block 数量
 - 写入吞吐、读取吞吐、客户端失败率
@@ -820,9 +821,9 @@ FsImage 是某一时刻的 namespace 快照；EditLog 记录快照之后发生�
 
 Active 和 Standby 需要共享连续的 EditLog。JournalNode 通过多数派保存共享 EditLog，使 Standby 可以追上 Active；它保存的是元数据变更日志，不是文件 Block。
 
-### 17.12 HA 中为什么需要 ZooKeeper？
+### 17.12 自动故障转移的 HA 中为什么需要 ZooKeeper？
 
-ZooKeeper 用于协调 Active/Standby 的选主和状态。它不保存用户数据，也不负责保存 HDFS 的 Block。为避免双主，还需要 fencing 机制隔离旧 Active。
+在自动故障转移的 HA 中，ZooKeeper 配合 ZKFC 协调 Active/Standby 的选主和状态；手动故障转移的 HA 不依赖 ZooKeeper 或 ZKFC。ZooKeeper 不保存用户数据，也不负责保存 HDFS 的 Block。为避免双主，还需要 fencing 机制隔离旧 Active。
 
 ### 17.13 什么是 split-brain？怎么避免？
 
@@ -946,26 +947,7 @@ HDFS：大文件、高吞吐、批处理
 HDFS 不擅长：小文件、随机写、低延迟行级查询
 ```
 
-## 20. 准确性复核记录
-
-本文生成后按以下项目进行复核和修订：
-
-- 区分了 NameNode 元数据与 DataNode 文件 Block。
-- 区分了 Active/Standby、SecondaryNameNode 和 Observer NameNode。
-- 明确 JournalNode 保存共享 EditLog，不保存用户 Block。
-- 明确 ZooKeeper 主要用于自动故障转移协调，不是 HDFS 数据存储。
-- 修正客户端通过逻辑 nameservice/failover proxy 访问当前 Active 的表达，避免误解为普通客户端直接读 Standby。
-- 对副本因子 3 的机架放置使用“尽量分散”表述，避免绝对化。
-- 细化了 `hflush`、`hsync`、客户端确认和物理落盘之间的区别。
-- 区分了 HA、Federation、Snapshot、备份和灾备。
-- 对 HDFS、Hive、Spark、HBase、Flink、Kafka 和湖格式的职责边界进行了区分。
-- 对 EC 与副本的空间、读写和恢复代价进行了双向说明。
-- 对 Safe Mode、fsck、Balancer 和删除命令补充了风险边界。
-- 没有把 HDFS 描述成数据库、缓存、消息队列或可以无限扩展的磁盘内存。
-
-> 复核结论：核心架构、组件职责、读写流程、HA/Federation 概念和常见面试结论之间没有发现明显的知识错误。版本相关的默认参数、命令选项和厂商发行版差异应以目标 Hadoop 版本文档为准。
-
-## 21. 官方参考文档
+## 20. 官方参考文档
 
 以下链接指向 Apache Hadoop 官方文档；阅读时应优先选择与集群实际版本匹配的文档：
 
@@ -975,17 +957,3 @@ HDFS 不擅长：小文件、随机写、低延迟行级查询
 - [HDFS Commands Guide](https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-hdfs/HDFSCommands.html)
 - [HDFS Erasure Coding](https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-hdfs/HDFSErasureCoding.html)
 - [HDFS Snapshots](https://hadoop.apache.org/docs/current/hadoop-project-dist/hadoop-hdfs/HDFSSnapshots.html)
-
-## 22. 最终评分
-
-本轮复核评分：**96/100**。
-
-| 维度 | 得分 | 说明 |
-| --- | ---: | --- |
-| 核心架构与组件职责 | 25/25 | NameNode、DataNode、Block、JournalNode、ZKFC、Observer 等边界清楚 |
-| 读写流程与一致性语义 | 24/25 | 覆盖 pipeline、数据本地性、校验和、单写者、`hflush`/`hsync`；具体持久化仍受版本和底层存储影响 |
-| HA、Federation、EC 与容错 | 19/20 | 说明了 fencing、QJM、多 namespace、纠删码与副本的取舍 |
-| 命令、配置与生产运维 | 14/15 | 命令和配置注明版本差异，并覆盖小文件、容量、Balancer、备份、安全 |
-| 面试覆盖与学习路线 | 14/15 | 面试题完整，仍可按目标岗位继续增加厂商发行版和源码细节 |
-
-没有发现需要纠正的实质性知识错误。剩余扣分主要来自 HDFS 发行版、Hadoop 小版本、底层文件系统和对象存储实现可能带来的默认值与命令差异；使用时应以实际集群版本的官方文档为最终依据。
