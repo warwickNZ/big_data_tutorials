@@ -406,13 +406,53 @@ Fencing 的目标是让旧 Active 失去继续写入的能力，方式可以是�
 
 ### 8.1 HDFS Federation
 
-Federation 允许多个独立 NameNode 管理不同 namespace，并共享同一组 DataNode。每个 namespace 通常对应自己的 Block Pool。
+Federation（联邦）允许多个相互独立的 NameNode 分别管理不同的 namespace，并共享同一组 DataNode。它的核心不是让多个 NameNode 共同管理同一个 namespace，而是把一个集群拆成多个相互独立的 namespace。
+
+每个 namespace 对应一个由其 NameNode 管理的 Block Pool。Block Pool 是属于某个 namespace 的 Block 集合；Block ID 在 Block Pool 范围内标识具体 Block，Block Pool ID 用于区分不同的 Block Pool。共享 DataNode 会同时保存来自多个 Block Pool 的 Block，并分别向对应的 NameNode 发送心跳和 Block Report。
 
 ```text
 Namespace A / NameNode A ─┐
 Namespace B / NameNode B ─┼─ 共享 DataNode 集群
 Namespace C / NameNode C ─┘
 ```
+
+例如：
+
+```text
+Namespace A / NameNode A / Block Pool A ─┐
+Namespace B / NameNode B / Block Pool B ─┼─ DataNode 1、DataNode 2、DataNode 3
+```
+
+每个 namespace 都有独立的目录树、文件元数据和 Block Pool，由对应的 NameNode 服务管理；非 HA 场景通常由一台 NameNode 管理，HA 场景则由同一 namespace 的 Active/Standby NameNode 对共同维护。不同 namespace 的元数据不会合并到同一个管理边界中。一个文件也只属于一个 namespace，由该 namespace 对应的 NameNode 服务管理；仅增加 Federation 节点，不能把同一个文件或同一个 namespace 的元数据自动拆到多个 NameNode 上。
+
+### 8.1.1 Federation 如何访问
+
+没有统一路由层时，客户端需要明确访问哪个 namespace，例如使用不同的逻辑 nameservice：
+
+```text
+hdfs://nsA/data/orders
+hdfs://nsB/user/alice
+```
+
+也可以使用 ViewFs 在客户端侧建立虚拟目录树，把不同路径映射到不同 namespace。ViewFs 主要是客户端配置和路由能力，不会把多个 NameNode 的元数据真正合并。
+
+如果希望对客户端提供统一入口，可以使用 Router-based Federation（RBF）。Router 根据 mount table 将路径解析到目标 namespace，再把元数据 RPC 转发给对应的 NameNode；客户端获得 Block 位置后，文件数据仍然直接在 Client 和 DataNode 之间传输，通常不会经过 Router。
+
+### 8.1.2 Federation 的收益
+
+- **扩展 namespace 元数据容量**：文件、目录和 Block 元数据分散到多个 NameNode，降低单个 NameNode 的内存压力。
+- **扩展元数据处理能力**：将不同业务或目录路由到不同 namespace 后，可以分散元数据 RPC 请求；但集中在一个 namespace 的热点仍受该 namespace NameNode 的能力限制。
+- **资源和管理隔离**：不同 namespace 可以按业务、团队或数据域划分权限、配额和运维边界。
+- **共享存储集群**：多个 namespace 复用 DataNode 和磁盘资源，避免为每个 namespace 建立完全独立的存储集群。
+
+### 8.1.3 Federation 的代价与边界
+
+- Federation 不会自动提供高可用；每个需要高可用的 namespace 都要配置自己的 Active/Standby 关系、共享 EditLog 和 fencing。多个 namespace 可以共享 JournalNode 集群和 ZooKeeper 集群等基础设施，具体取决于部署方案。
+- 多个 namespace 共享 DataNode 时，磁盘、网络和 DataNode 服务资源仍可能相互竞争，Federation 不是完全的物理资源隔离。
+- 路由、权限、配额、监控、备份和故障排查复杂度会增加。使用 RBF 时，还需要考虑 Router、State Store 和 mount table 的高可用。
+- 跨 namespace 的 rename 通常不支持；跨 mount point 的行为还取决于 ViewFs/RBF 及具体版本和配置，不能默认具备同一 namespace 内的原子 rename 语义。需要移动数据时，通常采用复制后删除，并由应用层负责协调。
+
+Federation 与 HA 可以组合使用。常见做法是让每个需要高可用的 namespace 都配置自己的 Active/Standby NameNode 对，从而同时获得 namespace 扩展能力和单个 namespace 的高可用能力；多个 namespace 的 JournalNode、ZooKeeper 等基础设施可以共享，但 namespace 状态和故障转移关系仍彼此独立。
 
 Federation 主要解决 NameNode 的 namespace、内存和元数据吞吐扩展问题；它和 HA 关注点不同：
 
@@ -423,7 +463,7 @@ Federation 主要解决 NameNode 的 namespace、内存和元数据吞吐扩展�
 
 ### 8.2 Router-based Federation
 
-Router-based Federation（RBF）在客户端和多个 namespace 之间增加 Router 层，为用户提供统一入口。它可以隐藏多个 namespace 的路由细节，但也引入 Router 的高可用、缓存、权限和运维问题。
+Router-based Federation（RBF）在客户端和多个 namespace 之间增加 Router 层，为用户提供统一入口。Router 依赖 mount table 和 State Store 维护路径到 namespace 的映射，可以隐藏多个 namespace 的路由细节，但也引入 Router、State Store 的高可用、缓存一致性、权限和运维问题。RBF 主要统一访问入口，不会消除底层 namespace 之间的管理边界。
 
 ### 8.3 Observer NameNode
 
@@ -859,7 +899,7 @@ Safe Mode 是 NameNode 的只读保护状态。启动时 NameNode 等待足够�
 
 ### 17.21 HDFS 的 HA 和 Federation 有什么区别？
 
-HA 关注同一 namespace 的服务连续性，通过 Active/Standby 降低 NameNode 单点风险；Federation 允许多个 NameNode 管理不同 namespace，主要解决 namespace、内存和元数据吞吐扩展问题。二者可以组合。
+HA 关注同一 namespace 的服务连续性，通过 Active/Standby 降低 NameNode 单点风险；Federation 允许多个 NameNode 分别管理不同 namespace，并让它们共享 DataNode，主要解决 namespace、内存和元数据吞吐扩展问题。Federation 不能把同一个 namespace 的元数据自动拆到多个 NameNode，且本身不等于高可用；每个 namespace 可以继续独立配置 HA，多个 namespace 可以共享 JournalNode、ZooKeeper 等基础设施，二者可以组合。
 
 ### 17.22 HDFS 和对象存储有什么区别？
 
@@ -940,7 +980,7 @@ ZooKeeper：HA 协调，不存文件数据
 ZKFC：健康检查、选主、故障转移
 SecondaryNameNode：Checkpoint，不是备用主节点
 HA：解决同一 namespace 的可用性
-Federation：扩展多个 namespace
+Federation：多个独立 namespace，各自拥有 NameNode 和 Block Pool，共享 DataNode
 副本：简单、可靠、空间成本高
 纠删码：省空间、恢复和小写入更复杂
 HDFS：大文件、高吞吐、批处理
