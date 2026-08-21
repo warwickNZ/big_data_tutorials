@@ -149,7 +149,7 @@ DataNode 负责：
 - 定期或增量发送 Block Report
 - 检测磁盘和 Block 校验和异常
 
-DataNode 通过多个本地目录存储数据。一个 DataNode 通常配置多块磁盘，以获得更大的容量和更好的并行 I/O；磁盘故障时，DataNode 会隔离异常存储目录。
+DataNode 通过多个本地目录存储数据。一个 DataNode 通常配置多块磁盘，以获得更大的容量和更好的并行 I/O；磁盘故障时，是否能隔离异常存储目录并继续服务取决于 `dfs.datanode.failed.volumes.tolerated` 等配置。
 
 ### 2.5 Block、Block Pool 与副本
 
@@ -167,9 +167,9 @@ Block 的几个要点：
 
 ### 2.6 JournalNode 与共享 EditLog
 
-在使用 Quorum Journal Manager（QJM）的 NameNode HA 中，Active NameNode 将 namespace 变更写入 JournalNode 集群。Standby NameNode 持续读取这些 EditLog，并把变更应用到自己的内存状态中。HDFS HA 也可以使用 NFS 等共享存储方案保存 EditLog，具体取决于部署配置。
+在使用 Quorum Journal Manager（QJM）的 NameNode HA 中，Active NameNode 将 namespace 变更写入 JournalNode 集群。Standby NameNode 持续读取这些 EditLog，并异步把变更应用到自己的内存状态中，因此通常接近 Active 的最新状态，但不保证零延迟或始终完全一致。HDFS HA 也可以使用 NFS 等共享存储方案保存 EditLog，具体取决于部署配置。
 
-常见部署是 3 个或更多 JournalNode，数量通常采用奇数，以便形成多数派。只要多数 JournalNode 可用，写入就可以继续；具体可用性还取决于版本和配置。
+常见部署是 3 个或更多 JournalNode，数量通常采用奇数，以便形成多数派。只要满足 QJM 配置要求的多数 JournalNode 可用，namespace EditLog 的提交通常就可以继续；这不等于 DataNode 文件数据写入一定成功，具体可用性还取决于版本和配置。
 
 JournalNode 只保存 QJM 方案中的共享 EditLog，不保存用户文件的 Block 数据。DataNode 的 Block 仍然各自保存在 DataNode 本地存储上。
 
@@ -398,7 +398,7 @@ Fencing 的目标是让旧 Active 失去继续写入的能力，方式可以是�
 | 项目 | Standby NameNode | SecondaryNameNode |
 | --- | --- | --- |
 | 主要目的 | HA 故障接管 | 非 HA 架构中合并 FsImage 与 EditLog，生成检查点 |
-| 是否持续同步 namespace | 是，读取共享 EditLog | 否，按周期做 checkpoint |
+| 是否持续同步 namespace | 是，异步读取并应用共享 EditLog，可能存在追赶延迟 | 否，按周期做 checkpoint |
 | 能否直接接管 Active | 在 HA 条件满足且完成切换时可以 | 不可以 |
 | 是否等同于备份 | 不是完整灾备备份 | 也不是独立备份 |
 
@@ -427,7 +427,7 @@ Router-based Federation（RBF）在客户端和多个 namespace 之间增加 Rou
 
 ### 8.3 Observer NameNode
 
-Observer NameNode 保存接近最新的 namespace 状态，并可在特定读语义下分担读请求，降低 Active NameNode 的元数据读压力。普通客户端不会自动使用 Observer，需要配置 `ObserverReadProxyProvider` 等相应的客户端路由；客户端状态 ID 可用于保证读请求不会落后于自身依赖的元数据进度，Observer 未追上时可能等待或按客户端策略回退到 Active。它不能接收写操作，也不应被误解为普通 DataNode 或独立存储节点。
+Observer NameNode 保存接近最新的 namespace 状态，并可在特定读语义下分担读请求，降低 Active NameNode 的元数据读压力。Observer 和 `ObserverReadProxyProvider` 是否可用取决于具体 Hadoop 版本和发行版，不能仅因为使用 Hadoop 3.x 就默认具备。普通客户端不会自动使用 Observer，需要配置相应的客户端路由；客户端状态 ID 可用于保证读请求不会落后于自身依赖的元数据进度，Observer 未追上时可能等待或按客户端策略回退到 Active。它不能接收写操作，也不应被误解为普通 DataNode 或独立存储节点。
 
 ## 9. 容错与故障处理
 
@@ -455,7 +455,7 @@ DataNode 可以配置多个存储目录。单块磁盘损坏后，DataNode 是�
 
 ### 9.3 NameNode 故障
 
-- 非 HA：元数据服务中断，需要人工恢复或启动备用节点。
+- 非 HA：元数据服务中断，需要恢复原 NameNode，或根据 FsImage、EditLog 和备份元数据重建 NameNode；SecondaryNameNode 不能直接接管。若需要自动接管，应部署 HA。
 - HA：Standby 在完成 fencing 和切换后接管 namespace 服务。
 
 无论是否 HA，都应分层保护：备份 FsImage 和 EditLog 以恢复 NameNode 元数据；通过 DistCp、跨集群复制或其他备份方案保留关键用户数据副本。HA 主要解决在线可用性，不等于防误删、勒索、全站故障和长期归档。
@@ -875,7 +875,7 @@ HDFS 依赖集群节点和 DataNode 管理 Block，强调计算集群内的数�
 
 ### 17.25 HDFS 的 Block 大小为什么通常较大？
 
-较大的 Block 可以减少 NameNode 元数据数量，并减少大文件顺序读写时的寻址和调度开销。过大可能降低小文件和细粒度并行效率，因此应结合文件大小、并行度和计算引擎基准测试决定。
+较大的 Block 可以减少 Block 数量、NameNode 元数据以及大文件切分和调度开销。小文件不会因为 Block 较大就实际占满一个 Block，也不能靠调大 Block 解决小文件问题；过大的 Block 还可能降低细粒度并行效率，因此应结合文件大小、并行度和计算引擎基准测试决定。
 
 ### 17.26 如何定位 HDFS 文件读取慢？
 
