@@ -87,24 +87,30 @@ Spark 是计算层，可以读取和写入数据库、数仓、HDFS、对象存�
 
 ### 2.1 Spark 逻辑架构图
 
-```text
-用户程序 / spark-submit
-          |
-          v
-      Driver
-  SparkSession / SparkContext
-  DAGScheduler / TaskScheduler
-          |
-          v
-   Cluster Manager
- (Standalone / YARN / Kubernetes)
-          |
-          v
-  Executor 1 ... Executor N
-  Task / Cache / Shuffle / Block
-          |
-          v
-HDFS / Object Storage / Kafka / JDBC
+```mermaid
+flowchart TD
+    U["用户程序 / spark-submit"] --> D
+
+    subgraph DRIVER["Driver"]
+        D["SparkSession / SparkContext"] --> DS["DAGScheduler"] --> TS["TaskScheduler"]
+    end
+
+    TS --> CM["Cluster Manager<br/>Standalone / YARN /<br/>Kubernetes"]
+
+    subgraph EXECUTORS["Executor 集群"]
+        E1["Executor 1<br/>Task / Cache /<br/>Shuffle / Block"]
+        EN["Executor N<br/>Task / Cache /<br/>Shuffle / Block"]
+    end
+
+    CM --> E1
+    CM --> EN
+
+    subgraph STORAGE["数据源与下游存储"]
+        FS["HDFS / Object Storage<br/>Kafka / JDBC"]
+    end
+
+    E1 --> FS
+    EN --> FS
 ```
 
 Driver 负责规划和协调，Cluster Manager 负责分配容器或进程资源，Executor 负责执行 Task。文件数据通常由 Executor 直接从数据源读写，不经过 Driver。[S2]
@@ -118,17 +124,19 @@ Driver 负责规划和协调，Cluster Manager 负责分配容器或进程资源
 
 SQL 的物理算子和 RDD Stage 并不是简单的一一对应；学习时要区分“用户可见的 SQL 计划”和“底层调度器执行的 Task”。
 
-```text
-Application
-+-- Job 1（由一个 Action 触发）
-|   +-- ShuffleMapStage（0 个或多个）
-|   |   `-- Task（按输入/Shuffle 分区生成）
-|   `-- ResultStage（1 个）
-|       `-- Task（按目标分区生成）
-`-- Job 2 ...
+```mermaid
+flowchart TD
+    APP["Application"]
+    APP --> JOB1["Job 1<br/>Action 触发"]
+    APP --> JOB2["Job 2 ..."]
 
-Task 失败或发生推测执行
-`-- 同一个逻辑 Task 可能产生多个 Task attempt
+    JOB1 --> SM["ShuffleMapStage<br/>0 个或多个"]
+    SM --> SMT["Task<br/>按输入 / Shuffle<br/>分区生成"]
+    JOB1 --> RS["ResultStage<br/>1 个"]
+    RS --> RST["Task<br/>按目标分区<br/>生成"]
+
+    SMT -.-> ATT["Task attempt<br/>失败重试 /<br/>推测执行"]
+    RST -.-> ATT
 ```
 
 ### 2.3 Driver 的职责
@@ -280,40 +288,45 @@ RDD 通常包含：分区列表、每个分区的计算函数、父依赖关系�
 
 ### 4.4 RDD 的依赖关系
 
-依赖描述子 RDD 如何从父 RDD 读取数据。窄依赖下，一个子分区只依赖少量固定父分区；宽依赖下，子分区需要从多个父分区重新分布数据，通常对应 Shuffle。依赖关系决定 Stage 边界和故障恢复成本。
+依赖描述子 RDD 如何从父 RDD 读取数据。窄依赖下，每个父分区至多被一个子分区使用，常见为一对一或按固定规则映射；宽依赖下，一个父分区可能被多个子分区使用，子分区通常需要跨多个父分区重新分布数据，对应 Shuffle。依赖关系决定 Stage 边界和故障恢复成本。
 
 ### 4.5 窄依赖与宽依赖
 
 | 维度 | 窄依赖 | 宽依赖 |
 | --- | --- | --- |
-| 数据关系 | 子分区依赖有限父分区 | 子分区需要跨多个父分区取数 |
+| 数据关系 | 每个父分区至多被一个子分区使用 | 一个父分区可能被多个子分区使用，通常需要跨多个父分区取数 |
 | 是否通常 Shuffle | 否 | 是 |
 | Stage 影响 | 可在同一 Stage 连续执行 | 通常形成 Stage 边界 |
 | 示例 | `map`、`filter`、部分 `union` | `groupByKey`、`reduceByKey`、`join`、`sortByKey` |
 
 “一对一”只是窄依赖的常见形式；判断标准是每个子分区是否只依赖有限的父分区，而不是只看算子名称。
 
-```text
-窄依赖：子分区只读取有限的父分区，通常可以流水执行
-P0 ----> C0 ----> D0
-P1 ----> C1 ----> D1
+```mermaid
+flowchart LR
+    subgraph NARROW["窄依赖：可流水执行"]
+        NP0["P0"] --> NC0["C0"] --> ND0["D0"]
+        NP1["P1"] --> NC1["C1"] --> ND1["D1"]
+    end
 
-宽依赖：多个父分区需要重新分布到子分区，通常经过 Shuffle
-P0 --+
-P1 --+--> Shuffle --> C0
-P2 --+              C1
+    subgraph WIDE["宽依赖：经过 Shuffle"]
+        WP0["P0"] --> SH["Shuffle"]
+        WP1["P1"] --> SH
+        WP2["P2"] --> SH
+        SH --> WC0["C0"]
+        SH --> WC1["C1"]
+    end
 ```
 
 ### 4.6 RDD Lineage
 
 Lineage 是 RDD 从输入到当前结果的依赖链。某个分区丢失时，Spark 可以根据 Lineage 重新运行必要的上游分区，而不必把所有中间结果都复制到可靠存储。Lineage 很长、重复计算昂贵或状态迭代频繁时，应考虑 Checkpoint。[S3]
 
-```text
-Input RDD -> map -> filter -> 当前 RDD
-                              |
-                              +--> Cache 命中：直接读取缓存分区
-                              +--> Cache 丢失：沿 Lineage 重算上游
-                              `--> Checkpoint：写入可靠存储，截断恢复链
+```mermaid
+flowchart LR
+    IN["Input RDD"] --> MAP["map"] --> FILTER["filter"] --> CUR["当前 RDD"]
+    CUR --> HIT["Cache 命中<br/>读取缓存分区"]
+    CUR --> MISS["Cache 丢失<br/>沿 Lineage 重算"]
+    CUR --> CP["Checkpoint<br/>写可靠存储<br/>截断恢复链"]
 ```
 
 ### 4.7 RDD 的容错机制
@@ -356,17 +369,17 @@ Cache/Persist 主要优化重复计算，数据仍可通过 Lineage 重算；Che
 
 ### 5.1 从提交应用到任务执行的完整流程
 
-```text
-spark-submit
-  -> 启动 Driver
-  -> 创建 SparkContext / SparkSession
-  -> 向 Cluster Manager 申请 Executor
-  -> Executor 注册并汇报资源
-  -> Action 触发 Job
-  -> DAGScheduler 按 Shuffle 划分 Stage
-  -> TaskScheduler 生成并调度 Task
-  -> Executor 读取数据、执行算子、写 Shuffle/结果
-  -> Driver 接收状态，完成 Job
+```mermaid
+flowchart TD
+    SUBMIT["spark-submit"] --> DRIVER["启动 Driver"]
+    DRIVER --> SESSION["创建 SparkContext / SparkSession"]
+    SESSION --> REQUEST["向 Cluster Manager<br/>申请 Executor"]
+    REQUEST --> REGISTER["Executor 注册<br/>汇报资源"]
+    REGISTER --> ACTION["Action 触发 Job"]
+    ACTION --> DAG["DAGScheduler<br/>按 Shuffle 划分 Stage"]
+    DAG --> SCHEDULE["TaskScheduler 调度 Task"]
+    SCHEDULE --> RUN["Executor 读取数据<br/>执行算子、写 Shuffle / 结果"]
+    RUN --> DONE["Driver 接收状态<br/>完成 Job"]
 ```
 
 Driver 只发送任务和控制信息，实际数据通常在 Executor 与数据源、Shuffle 服务之间流动。[S2][S4]
@@ -395,19 +408,13 @@ Executor 获取 Task 后反序列化闭包，读取输入分区，逐步执行�
 
 ShuffleMapStage 的输出按下游分区写入 Shuffle 文件并记录 MapStatus；ResultStage 的 Task 读取上游结果并完成 Action，例如把结果返回 Driver 或写入文件。一个 Job 通常包含一个 ResultStage，以及为它准备数据的零个或多个 ShuffleMapStage；一个 Application 才可能包含多个 Job 和多个 ResultStage。[S4]
 
-```text
-Stage 0: ShuffleMapStage
-  Task 0 ... Task N
-        |
-        v
-  Shuffle files + MapStatus
-        |
-        v
-Stage 1: ShuffleMapStage（或 ResultStage）
-  Task 0 ... Task M
-        |
-        v
-  下一条 Shuffle 边界或最终输出
+```mermaid
+flowchart TD
+    S0["Stage 0: ShuffleMapStage"] --> T0["Task 0 ... Task N"]
+    T0 --> SHUFFLE["Shuffle files<br/>+ MapStatus"]
+    SHUFFLE --> S1["Stage 1<br/>ShuffleMapStage 或 ResultStage"]
+    S1 --> T1["Task 0 ... Task M"]
+    T1 --> OUTPUT["下一条 Shuffle 边界<br/>或最终输出"]
 ```
 
 ### 5.8 Stage 重试与 Task 重试
@@ -462,18 +469,15 @@ DataFrame 的一行通常以 `Row` 形式暴露给用户；物理执行中常使
 
 ### 6.7 Spark SQL 执行流程
 
-```text
-SQL Parser / DataFrame API
-        ↓
-Unresolved Logical Plan
-        ↓ Analyzer
-Analyzed Logical Plan
-        ↓ Optimizer
-Optimized Logical Plan
-        ↓ Planner
-Physical Plan
-        ↓ Codegen / Runtime Statistics / AQE
-执行算子与 Task
+```mermaid
+flowchart TD
+    API["SQL Parser / DataFrame API"] --> UNRESOLVED["Unresolved Logical Plan"]
+    UNRESOLVED -->|Analyzer| ANALYZED["Analyzed Logical Plan"]
+    ANALYZED -->|Optimizer| OPTIMIZED["Optimized Logical Plan"]
+    OPTIMIZED -->|Planner| PHYSICAL["Physical Plan"]
+    PHYSICAL --> AQE["Runtime Statistics / AQE"]
+    AQE --> CODEGEN["Codegen<br/>可执行算子"]
+    CODEGEN --> TASKS["执行算子与 Task"]
 ```
 
 实际执行计划可用 `df.explain("extended")`、`formatted` 或 `cost` 等模式查看。计划是诊断起点，最终性能还要结合 Spark UI 的输入、Shuffle、Spill、Task 分布和运行时指标。
@@ -582,18 +586,22 @@ Shuffle 是为了让具有相同分区键或目标分区的数据跨节点重新
 
 ### 7.2 Shuffle 的整体流程
 
-```text
-Map Task
-  -> 按分区器组织记录
-  -> 内存缓冲、排序/聚合
-  -> 内存不足时 Spill
-  -> 生成本地 Shuffle 文件
-  -> 上报 MapStatus
-Reduce Task
-  -> 查询 Map 输出位置
-  -> 拉取各 Map 的目标分区
-  -> 合并、排序/聚合
-  -> 交给下游算子
+```mermaid
+flowchart TD
+    subgraph MAP["Map Task"]
+        M1["按分区器组织记录"] --> M2["内存缓冲<br/>排序 / 聚合"]
+        M2 --> M3["内存不足<br/>Spill"]
+        M3 --> M4["生成本地<br/>Shuffle 文件"]
+        M4 --> M5["上报<br/>MapStatus"]
+    end
+
+    M5 --> R1["查询 Map 输出位置"]
+
+    subgraph REDUCE["Reduce Task"]
+        R1 --> R2["拉取各 Map<br/>目标分区"]
+        R2 --> R3["合并、排序<br/>/ 聚合"]
+        R3 --> R4["交给下游<br/>算子"]
+    end
 ```
 
 ### 7.3 Map 端 Shuffle Write
@@ -654,19 +662,19 @@ JVM 堆由 `spark.executor.memory` 或 `spark.driver.memory` 等参数控制；�
 
 一个 Executor 的资源预算通常包含 JVM Heap、Memory Overhead、可选的 Off-Heap，以及 Python Worker 等进程开销。Unified Memory Manager 在 Spark 管理的 Execution/Storage 区域中管理执行内存和存储内存，默认主要使用 Heap；启用 off-heap 后还会使用配置的堆外区域。用户对象、Python 数据、Native 库、Netty 缓冲等不一定落在这个统一池里。具体容器计算方式由 Spark 和 Cluster Manager 版本决定。[S5]
 
-```text
-Executor / Container 内存预算（概念图）
-|
-+-- JVM Heap（executor.memory）
-|   +-- Unified Memory
-|   |   +-- Execution：Shuffle、排序、聚合、Join
-|   |   `-- Storage：缓存、广播、查询结果
-|   `-- User Memory：用户对象和其他 JVM 数据
-`
-    `-- Memory Overhead / 非 Heap 预算
-        +-- JVM 非堆、Netty、Native 库
-        +-- Python Worker
-        `-- Spark Off-Heap（启用时）
+```mermaid
+flowchart TD
+    EXEC["Executor / Container<br/>内存预算"]
+    EXEC --> HEAP["JVM Heap<br/>executor.memory"]
+    HEAP --> UNIFIED["Unified Memory"]
+    UNIFIED --> EXECUTION["Execution<br/>Shuffle、排序、聚合<br/>Join"]
+    UNIFIED --> STORAGE_MEM["Storage<br/>缓存、广播<br/>查询结果"]
+    HEAP --> USER["User Memory<br/>用户对象和其他<br/>JVM 数据"]
+
+    EXEC --> OVERHEAD["Memory Overhead<br/>非 Heap 预算"]
+    OVERHEAD --> NONHEAP["JVM 非堆、Netty<br/>Native 库"]
+    OVERHEAD --> PYTHON["Python Worker"]
+    OVERHEAD --> OFFHEAP["Spark Off-Heap（启用时）"]
 ```
 
 ### 8.4 Unified Memory Manager
@@ -722,20 +730,17 @@ Driver OOM 优先检查 `collect`、`toPandas`、`show`、广播构建、过大�
 
 先建立基线，再通过 Spark UI、SQL 执行计划、事件日志、Executor 日志和数据统计定位瓶颈。重点区分：输入读取慢、计划不优、Shuffle 大、数据倾斜、GC/内存、节点/网络、输出提交和下游 Sink 慢。每次只改变少量参数，并用相同数据和业务结果对比。[S6][S8]
 
-```text
-慢作业
-  |
-  +--> Spark UI / EXPLAIN / 日志
-  |
-  +--> 定位主要瓶颈
-  |      +-- 输入读取、过滤和列裁剪
-  |      +-- 物理计划、Join 和 Exchange
-  |      +-- Shuffle、倾斜和长尾
-  |      +-- 内存、GC 和 Spill
-  |      `-- 外部系统、资源等待和输出提交
-  |
-  +--> 一次只改少量变量
-  `--> 对比耗时、资源、结果和输出质量
+```mermaid
+flowchart TD
+    SLOW["慢作业"] --> OBSERVE["Spark UI / EXPLAIN<br/>日志"]
+    OBSERVE --> BOTTLENECK["定位主要<br/>瓶颈"]
+    BOTTLENECK --> INPUT["输入读取、过滤<br/>和列裁剪"]
+    BOTTLENECK --> PLAN["物理计划、Join<br/>和 Exchange"]
+    BOTTLENECK --> SHUFFLE["Shuffle、倾斜<br/>和长尾"]
+    BOTTLENECK --> MEMORY["内存、GC<br/>和 Spill"]
+    BOTTLENECK --> EXTERNAL["外部系统、资源等待<br/>和输出提交"]
+    BOTTLENECK --> CHANGE["一次只改少量变量"]
+    CHANGE --> COMPARE["对比耗时、资源、结果和输出质量"]
 ```
 
 ### 9.2 读取数据量优化
@@ -902,26 +907,24 @@ Structured Streaming 是基于 Spark SQL/DataFrame 的流处理引擎。它把�
 
 输入 Source 产生带 offset 的数据，查询定义 Transformation，输出 Sink 写出结果。无状态算子可以按批次独立处理；聚合、去重、流流 Join 等有状态算子需要 State Store 和 checkpoint。流查询不是普通批查询的无限 `collect`，必须明确输出模式、状态生命周期和故障恢复位置。
 
-```text
-Source / Offset
-      |
-      v
-Trigger 确定本批次输入范围
-      |
-      v
-Micro-Batch
-  +--> Transformation --> State Store / Watermark --> Sink
-  `--> checkpoint：offset、批次提交信息、状态恢复元数据
+```mermaid
+flowchart TD
+    SOURCE["Source / Offset"] --> TRIGGER["Trigger<br/>确定本批次输入范围"]
+    TRIGGER --> BATCH["Micro-Batch"]
+    BATCH --> TRANSFORM["Transformation"]
+    TRANSFORM --> STATE["State Store / Watermark"]
+    STATE --> SINK["Sink"]
+    BATCH --> CHECKPOINT["Checkpoint<br/>offset、批次提交信息<br/>状态恢复元数据"]
 
-Driver 重启
-  `--> 从 checkpoint 恢复进度和状态，继续处理可重放数据
+    RESTART["Driver 重启"] --> RESTORE["从 checkpoint 恢复<br/>进度和状态"]
+    RESTORE --> SOURCE
 ```
 
 上图表示概念关系；不同 Source/Sink 的 offset log、commit log 和状态文件写入时序可能不同。
 
 ### 11.3 Micro-Batch 与 Continuous Processing
 
-Micro-Batch 在每个触发周期确定可处理的输入范围，运行一个或多个批次 Job，完成后提交进度；这是 Structured Streaming 的主流生产模型。Continuous Processing 试图降低延迟，但支持的算子、Sink 和语义范围有限，不能默认适用于任意查询；选择前应以目标版本文档和实际 Sink 测试为准。[S9]
+Micro-Batch 在每个触发周期确定可处理的输入范围，运行一个微批次；这个微批次内部可能包含多个 Spark Job，全部完成后再提交进度。这是 Structured Streaming 的主流生产模型。Continuous Processing 试图降低延迟，但支持的算子、Sink 和语义范围有限，不能默认适用于任意查询；选择前应以目标版本文档和实际 Sink 测试为准。[S9]
 
 ### 11.4 Streaming DataFrame 与 Streaming Query
 
@@ -967,16 +970,19 @@ Kafka Source 按 topic 分区读取记录，并把处理进度写入 Spark check
 
 Structured Streaming 的 exactly-once 不是一个无条件全局承诺。引擎可以通过 checkpoint 和可重放 Source 恢复批次进度；要实现端到端 exactly-once，还需要 Sink 支持事务提交、幂等写入或按 batch ID 去重。`foreachBatch` 默认更接近至少一次调用，需要应用使用 `batchId` 设计幂等；普通外部 API 写入不能因为查询有 checkpoint 就自动获得 exactly-once。[S9]
 
-```text
-正常执行：Source -> Batch N -> Sink 提交 -> checkpoint 记录进度
+```mermaid
+flowchart TD
+    SOURCE["可重放<br/>Source"] --> BATCH["Batch N"]
+    BATCH --> SINK["Sink 写入"]
+    SINK --> COMMIT{"Sink 提交<br/>成功？"}
+    COMMIT -->|是| CHECKPOINT["Checkpoint<br/>记录进度"]
+    COMMIT -->|否 / 重试| REPLAY["Source 重放<br/>Batch N"]
+    REPLAY --> BATCH
 
-中途失败：Source 重放 -> Batch N 重试
-                         |
-                         +--> 事务 Sink：提交一次
-                         `--> 幂等 Sink：按 batchId / 业务键去重
-                                      |
-                                      v
-                              一个业务结果（端到端语义）
+    SINK -->|事务方案| TX["事务 Sink<br/>提交一次"]
+    SINK -->|幂等方案| IDEMPOTENT["幂等 Sink<br/>按 batchId / 业务键去重"]
+    TX --> RESULT["一个业务结果<br/>端到端语义"]
+    IDEMPOTENT --> RESULT
 ```
 
 ### 11.14 幂等写入与事务 Sink
@@ -1426,21 +1432,17 @@ Spark Driver/Executor 的故障重试不等于数据平台灾备。要准备 Eve
 
 OutputCommitCoordinator 负责 Spark Task 尝试之间的协调；Hadoop OutputCommitter/Commit Protocol 负责任务和作业输出的提交、清理和最终可见性；表格式还可能有自己的事务提交。三者职责相关但不相同，不能因为开启一个 Coordinator 就认为所有输出具备事务性。[S26][S27][S28]
 
-```text
-Task attempt A ----+
-                   +--> OutputCommitCoordinator
-Task attempt B ----+          |
-                              +--> 每个分区只允许一个尝试提交
-                              |          |
-                              |          v
-                              |   OutputCommitter / Commit Protocol
-                              |          |
-                              |          v
-                              |      最终输出
-                              `--> 其他尝试：abort / cleanup
+```mermaid
+flowchart TD
+    ATTEMPT_A["Task attempt A"] --> COORDINATOR["OutputCommit<br/>Coordinator"]
+    ATTEMPT_B["Task attempt B"] --> COORDINATOR
+    COORDINATOR --> PERMISSION["每个分区<br/>只允许一个尝试提交"]
+    PERMISSION --> PROTOCOL["OutputCommitter<br/>/ Commit Protocol"]
+    PROTOCOL --> FINAL_OUTPUT["最终输出"]
+    PERMISSION -.-> CLEANUP["其他尝试：abort / cleanup"]
 
-数据库、HTTP、消息等外部副作用
-`--> 仍需自己的事务、幂等键或去重机制
+    EXTERNAL["数据库、HTTP、消息<br/>等外部副作用"]
+    EXTERNAL --> IDEMPOTENCY["仍需自己的事务、<br/>幂等键或去重机制"]
 ```
 
 ### 17.15 对象存储上的提交机制
@@ -1564,7 +1566,7 @@ SQL 物理计划先转换为可执行算子及其 RDD，DAGScheduler 再沿 RDD 
 
 ### 19.6 什么是宽依赖和窄依赖？
 
-窄依赖中子分区只依赖有限父分区，通常不需要 Shuffle；宽依赖中子分区需要从多个父分区重新分布数据，通常触发 Shuffle 和 Stage 边界。不要只按算子名称判断，要看依赖和物理计划。
+窄依赖中每个父分区至多被一个子分区使用，通常不需要 Shuffle；宽依赖中一个父分区可能被多个子分区使用，通常需要跨分区重分布并触发 Shuffle 和 Stage 边界。不要只按算子名称判断，要看依赖和物理计划。
 
 ### 19.7 Spark 为什么采用惰性求值？
 
@@ -1688,7 +1690,7 @@ Window 定义如何按时间分组数据；Watermark 定义系统允许事件时
 
 ### 19.37 Spark 如何消费 Kafka 数据？
 
-Kafka Source 按 topic/partition 和 offset 读取。以 Micro-Batch 为例，checkpoint 中的 `offsets/` 日志记录各批次的 Source 端点，通常在批次执行前写入；`commits/` 日志记录已经成功提交的批次，并可保存与提交相关的元数据，通常在 Sink 提交成功后写入。查询重启时会结合这两类日志恢复进度和判断已完成批次；这不是向 Kafka Consumer Group 提交 offset。起始 offset 通常只影响无 checkpoint 的首次启动；Kafka retention 和下游 Sink 语义需要单独处理。[S9][S20]
+Kafka Source 按 topic/partition 和 offset 读取。以 Micro-Batch 为例，checkpoint 中的 `offsets/` 日志记录各批次的 Source 端点，通常在批次执行前写入；`commits/` 日志记录已经成功提交的批次，并可保存与提交相关的元数据，通常在 Sink 提交成功后写入。查询重启时会结合这两类日志恢复进度和判断已完成批次；这不是向 Kafka Consumer Group 提交 offset。起始 offset 通常只影响无 checkpoint 的首次启动；Kafka retention 和下游 Sink 语义需要单独处理。[S9][S20][S31]
 
 ### 19.38 Spark 的 Client 模式和 Cluster 模式有什么区别？
 
@@ -1894,3 +1896,4 @@ Task 重试/推测执行要求输出提交和 Sink 幂等；Event Log 复盘，M
 - [S28] [Hadoop OutputCommitter API](https://hadoop.apache.org/docs/stable/api/org/apache/hadoop/mapreduce/OutputCommitter.html)
 - [S29] [GraphFrames Documentation](https://graphframes.io/)
 - [S30] [SparkR Programming Guide](https://spark.apache.org/docs/3.5.7/sparkr.html)
+- [S31] [Apache Spark 3.5.7 MicroBatchExecution source](https://github.com/apache/spark/blob/v3.5.7/sql/core/src/main/scala/org/apache/spark/sql/execution/streaming/MicroBatchExecution.scala)
