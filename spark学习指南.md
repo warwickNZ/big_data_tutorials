@@ -242,7 +242,7 @@ Transformation（如 `map`、`filter`、`select`、`join`）生成新的 RDD/Dat
 
 ### 3.4 DAG 与执行计划
 
-RDD API 通过依赖关系形成 DAG；Spark SQL 还会经历解析、分析、逻辑优化、物理计划选择和执行代码生成。DAG 是计算依赖图，不等于线程图，也不等于最终会生成一个 Task；真正的 Task 数量受 Stage 分区数、过滤、AQE 和资源情况影响。[S7][S8]
+RDD API 通过依赖关系形成 DAG；Spark SQL 还会经历解析、分析、逻辑优化、物理计划选择和执行代码生成。DAG 是计算依赖图，不等于线程图，也不代表只生成一个 Task；真正的 Task 数量受 Stage 分区数、过滤、AQE 和资源情况影响。[S7][S8]
 
 ### 3.5 分区与并行度
 
@@ -299,7 +299,7 @@ RDD 通常包含：分区列表、每个分区的计算函数、父依赖关系�
 | Stage 影响 | 可在同一 Stage 连续执行 | 通常形成 Stage 边界 |
 | 示例 | `map`、`filter`、部分 `union` | `groupByKey`、`reduceByKey`、`join`、`sortByKey` |
 
-“一对一”只是窄依赖的常见形式；判断标准是每个子分区是否只依赖有限的父分区，而不是只看算子名称。
+“一对一”只是窄依赖的常见形式；严格判断应以父分区角度为准，即每个父分区至多被一个子分区使用，而不是只看算子名称。
 
 ```mermaid
 flowchart LR
@@ -558,23 +558,27 @@ SQL 中条件结果可能是 TRUE、FALSE 或 UNKNOWN。普通 `WHERE` 只保留
 
 隐式类型转换可能导致精度丢失、字符串解析差异或 Join 条件不符合预期。日期时间处理还涉及 Session 时区、数据源时区、夏令时和字符串格式；生产数据应统一时区和格式，显式 cast，并通过边界日期、NULL 和跨时区样例测试。
 
-### 6.27 Window Function
+### 6.27 ANSI SQL 模式与 Legacy 开关
+
+Spark 通过 `spark.sql.ansi.enabled` 提供 ANSI SQL 模式，默认值与版本相关：Spark 3.5.x 默认关闭，Spark 4.x 起默认开启，应以目标版本文档和运行环境为准。开启后，整数除零、算术溢出、非法类型转换、部分日期时间函数的越界输入等操作会直接报错，而不是默认模式下的返回 NULL、截断结果或宽松解析。数据库兼容相关的 `spark.sql.legacy.*` 开关控制对旧版本或 Hive 行为的模拟，与 ANSI 模式叠加后行为组合很多，不能套用旧版博客的固定规则。生产上应在目标版本上用除零、溢出、边界日期时间和非法转换等样例，分别验证 SQL 与 DataFrame API 的行为。[S7]
+
+### 6.28 Window Function
 
 Window Function 在分区内按排序和窗口范围计算排名、累计值、偏移值或聚合，例如 `row_number`、`rank`、`lag` 和窗口 `sum`。它通常需要按分区键重分布并排序，数据倾斜和窗口过大时成本很高；窗口的 `partitionBy`、`orderBy` 和 frame 定义必须明确。
 
-### 6.28 UDAF 与 UDTF
+### 6.29 UDAF 与 UDTF
 
 UDAF 将多行聚合为一个值，适合自定义统计；UDTF 将一行或一组输入展开为多行。优先使用内置聚合和表函数；自定义函数的注册 API、Python 支持和优化边界随 Spark 版本变化，尤其是 UDTF 应以目标版本文档为准。
 
-### 6.29 Join 语义与 NULL Join
+### 6.30 Join 语义与 NULL Join
 
 Inner、Left、Right、Full、Semi、Anti Join 的保留行规则不同；普通等值 Join 不会把两个 NULL 视为相等，若需要 null-safe Join 应显式使用相应表达式。Join 结果还可能因一对多关系发生行数膨胀，性能优化不能改变业务语义。
 
-### 6.30 EXPLAIN 与执行计划查看
+### 6.31 EXPLAIN 与执行计划查看
 
 `df.explain()` 可查看物理计划，`extended` 可同时查看多个计划阶段，`formatted` 便于阅读，`cost` 显示统计估算，`codegen` 查看代码生成信息（具体模式以版本为准）。诊断时应关注 Scan 是否裁剪、是否出现 Exchange、Join 策略、分区数和是否发生 AQE 重写。
 
-### 6.31 表缓存、元数据刷新与缓存失效
+### 6.32 表缓存、元数据刷新与缓存失效
 
 `cacheTable`/`CACHE TABLE` 缓存表或查询结果；`REFRESH TABLE`、`refreshByPath` 等操作用于刷新文件列表或元数据缓存。外部系统直接新增文件、改变 Schema 或替换目录后，Spark Session 可能仍持有旧元数据；缓存只能提高读取速度，不能替代表格式的事务快照和并发控制。
 
@@ -791,11 +795,15 @@ Shuffle Hash Join 先按 Join Key 重分区，在每个分区内构建一侧哈�
 
 Broadcast Nested Loop Join 不要求等值 Join Key，通常广播一侧后进行嵌套匹配，复杂度和内存代价可能很高。它适用于小表、非等值条件或特殊 Join 类型，不能把它当作普通广播等值 Join 的替代品。
 
-### 9.14 数据倾斜识别
+### 9.14 SQL Hint 与 Query Hint
+
+Query Hint 允许用户对计划选择给出提示，通过 DataFrame 的 `df.hint(...)` 或 SQL 的 `/*+ ... */` 注释指定，例如 `BROADCAST`、`MERGE`、`SHUFFLE_HASH`、`SHUFFLE_REPLICATE_NL`、`REPARTITION`、`COALESCE`、`REPARTITION_BY_RANGE` 等。Hint 是对优化器的提示，不是强制指令，也不能覆盖数据源不支持的能力；最终是否采纳受版本、统计信息、广播阈值、ANSI/兼容模式和 AQE 影响，应在 `explain` 中确认实际生效的算子。[S8]
+
+### 9.15 数据倾斜识别
 
 数据倾斜表现为少数 Task 的输入、Shuffle Read、运行时间或 Spill 远高于中位数，常见根因是热点 Key、空值 Key、分区分布不均、Join 一对多膨胀或极端文件。应结合业务 Key 频次、SQL 计划和 Spark UI 统计确认，不要只看 Stage 总耗时。
 
-### 9.15 数据倾斜解决方案
+### 9.16 数据倾斜解决方案
 
 - 过滤、拆分或单独处理热点 Key。
 - 对可结合聚合使用 map-side combine。
@@ -806,39 +814,39 @@ Broadcast Nested Loop Join 不要求等值 Join Key，通常广播一侧后进�
 
 加盐会增加逻辑复杂度，必须验证重复、NULL、聚合结合性和最终结果。
 
-### 9.16 小文件问题
+### 9.17 小文件问题
 
 小文件会增加文件列表、任务启动、对象存储请求、NameNode/Metastore 压力和下游扫描开销。解决方式包括控制上游并行度、批量写入、定期 compaction、合理分区和表格式维护；不能只把 `spark.sql.shuffle.partitions` 调大或调小。目标文件大小应通过实际引擎和存储基准确定。
 
-### 9.17 AQE 自适应查询执行
+### 9.18 AQE 自适应查询执行
 
 AQE 在运行过程中利用 Shuffle 统计重新优化计划，Spark 3.x 常见能力包括合并小 Shuffle 分区、处理倾斜 Join，以及在条件满足时调整 Join 策略。AQE 不是所有 SQL 都能显著加速；初始计划、统计信息、分区边界和版本配置仍然重要。[S8]
 
-### 9.18 Dynamic Partition Pruning（DPP）
+### 9.19 Dynamic Partition Pruning（DPP）
 
 DPP 在 Join 的一侧得到过滤值后，动态过滤另一侧按分区列组织的数据，减少无关分区扫描。它要求 Join 形态、分区列和计划满足优化条件，广播复用、分区数量和配置也会影响是否生效；应从物理计划和 Scan 指标确认，不要把 DPP 当作普通过滤的同义词。
 
-### 9.19 动态合并 Shuffle 分区
+### 9.20 动态合并 Shuffle 分区
 
 AQE 可以根据运行时 Shuffle 数据量合并过小的 Reduce 分区，减少空 Task 和小输出文件。合并后的分区数不应与初始 `spark.sql.shuffle.partitions` 混为一谈；后者是初始 Shuffle 分区目标，最终数量可能由运行时统计及其他 AQE 规则决定。
 
-### 9.20 Speculative Execution
+### 9.21 Speculative Execution
 
 推测执行会为运行明显落后的 Task 启动副本，以降低单节点或单 Task 长尾。它可能增加资源和输入读取，且对有外部副作用的 `foreach`、非幂等写入存在风险；输出提交协议需要确保只有一个合法尝试提交结果。[S5]
 
-### 9.21 序列化与压缩优化
+### 9.22 序列化与压缩优化
 
 Kryo、压缩 Shuffle、压缩缓存和列式编码可以降低网络/磁盘量，但会增加 CPU。应结合 CPU、网络、磁盘和内存指标选择，不要在没有基线的情况下同时修改多个序列化和压缩开关。
 
-### 9.22 文件格式与压缩格式选择
+### 9.23 文件格式与压缩格式选择
 
 分析型数据通常优先 Parquet/ORC 等列式格式，便于列裁剪、谓词下推和压缩；JSON/CSV 便于交换但解析和体积成本较高。压缩格式要在压缩率、解压 CPU、Splittable 能力和下游兼容性之间取舍，不能只按压缩率排名。
 
-### 9.23 并行度与资源配置
+### 9.24 并行度与资源配置
 
 并行度应与数据规模和可用 CPU 匹配：Task 太少会闲置资源，Task 太多会放大调度和 Shuffle 元数据开销。Executor 数量、每个 Executor 的核数、内存和分区数应一起调优；过大的 Executor 可能带来 GC 和单点失败风险，过小则增加网络和调度开销。
 
-### 9.24 性能优化的常见误区
+### 9.25 性能优化的常见误区
 
 - 只调参数，不看 SQL 计划和 Spark UI。
 - 把 Spark 说成纯内存计算。
@@ -885,15 +893,21 @@ Structured Streaming 的 Kafka Source 按 topic/partition 读取记录和 offset
 
 分区表把常用过滤列编码进目录或表元数据，帮助跳过无关数据。分区列不应选择基数极高且写入频繁变化的字段，否则会产生大量目录和小文件。分区设计应结合查询条件、数据量、更新模式和下游表格式，而不是按字段数量越多越好。
 
-### 10.10 数据源分区读取
+### 10.10 分桶（Bucketing）与聚类布局
+
+分桶按分桶列把数据散列到固定数量的文件中（DataFrame 的 `bucketBy`，DDL 中对应 `CLUSTERED BY ... INTO n BUCKETS`），这与按列值划分目录的分区不同：分区影响目录结构，分桶主要影响文件数量和单文件大小，并可能带来桶级裁剪。两侧数据若按相同的分桶列和兼容的桶数分布，部分 Join 可以在桶内完成匹配而避免额外 Shuffle；查询条件覆盖分桶列时也可能跳过无关桶。但这些优化依赖 Spark 的写入约定和表元数据，手动改动目录、被其他引擎重写或分桶列表不匹配后可能失效，此时引擎会自动退回普通 Shuffle，分桶元数据也需要按版本校验。
+
+`sortBy` 可与分桶组合以固定桶内排序，但排序要求未被满足时优化同样会退化。更高版本或湖表平台中可能引入声明式聚类（declarative clustering）等新的数据布局能力，其语义与固定桶数分桶不同，是否支持、如何维护需以 Spark 版本和表格式文档为准。并非所有表都适合分桶，应与分区设计、查询模式和表格式能力一起评估。[S7]
+
+### 10.11 数据源分区读取
 
 输入分区决定初始并行度，受文件切分、文件数量、文件大小和数据源实现影响。JDBC 分区、Kafka 分区和文件分区语义不同；调整 `spark.sql.files.maxPartitionBytes`、`spark.sql.files.openCostInBytes` 等参数时要通过读取任务数、单 Task 输入和实际吞吐验证。[S5]
 
-### 10.11 Schema 管理与演进
+### 10.12 Schema 管理与演进
 
 Schema 需要明确新增列、删除列、类型变更、默认值、兼容性和回滚策略。Parquet/ORC 文件的 Schema 合并可能增加元数据读取和类型冲突风险；湖表格式通常提供更明确的 Schema 演进规则，但仍需确认 Spark 版本、Catalog 和表格式能力。
 
-### 10.12 Data Source V1 与 Data Source V2
+### 10.13 Data Source V1 与 Data Source V2
 
 Data Source V2 提供更细粒度的 Table、Scan、Write、Catalog 和能力声明，便于支持列裁剪、过滤、分区、事务提交和流读写；V1 仍广泛存在。不同 Provider 的 V2 支持程度不一致，不能仅凭“使用 V2”推断所有优化和事务能力都可用。
 
@@ -958,15 +972,21 @@ Watermark 是引擎根据已观察到的事件时间推进的“足够旧”边�
 
 State Store 为流聚合、去重和流流 Join 保存跨批次状态，状态按算子和分区管理，并通过 checkpoint 恢复。状态规模取决于 Key 基数、窗口、Watermark 和去重范围；没有清理边界的状态查询可能持续增长。State Store 的具体后端和增量能力随 Spark 版本及配置变化。
 
-### 11.11 Checkpoint Location
+### 11.11 mapGroupsWithState 与 flatMapGroupsWithState
+
+`mapGroupsWithState` 与 `flatMapGroupsWithState` 由 Scala/Java 的 Dataset API（`KeyValueGroupedDataset`）提供，PySpark 未提供。它们用于内置聚合、Join 和去重都无法覆盖的任意有状态处理：按 Key 分组，每个批次通过 `GroupState` 维护跨批状态，可更新或删除，并可设置基于事件时间或处理时间的超时，来决定何时输出与何时清理状态。`mapGroupsWithState` 每个键每批最多输出一行，`flatMapGroupsWithState` 可以输出零到多行。
+
+状态的生命周期必须显式设计：事件时间超时依赖设置 Watermark 和正确的超时时间戳，否则旧状态可能永不清理并持续增长；处理时间超时只与处理时钟相关，不代表业务时间语义。状态的跨批保存与恢复依赖 checkpoint 和状态序列化（Encoder），任意自定义状态逻辑的恢复行为需要按真实 Watermark、超时和 Key 分布测试。该 API 本身不提供端到端 exactly-once，外部写入仍需事务或幂等设计；函数签名、超时语义和版本兼容随 Spark 版本变化，使用前应以目标版本文档为准。[S9]
+
+### 11.12 Checkpoint Location
 
 Structured Streaming checkpoint 通常保存源 offset、批次提交信息、状态快照/增量和查询恢复所需元数据。它不是普通业务数据备份，也不应在查询运行中随意删除、移动或被多个不兼容查询共享。更换查询逻辑、Source 结构或 Sink 时，是否能复用 checkpoint 必须经过版本和语义验证。
 
-### 11.12 Kafka 与 Structured Streaming
+### 11.13 Kafka 与 Structured Streaming
 
 Kafka Source 按 topic 分区读取记录，并把处理进度写入 Spark checkpoint。Kafka 的 topic 分区、保留期、起始 offset、最大每批读取量和异常消息策略都会影响吞吐和延迟。Kafka Sink 的重复、事务和幂等语义需要单独验证；Source 读取成功不代表下游业务提交成功。[S9][S19][S20]
 
-### 11.13 Exactly-Once 语义
+### 11.14 Exactly-Once 语义
 
 Structured Streaming 的 exactly-once 不是一个无条件全局承诺。引擎可以通过 checkpoint 和可重放 Source 恢复批次进度；要实现端到端 exactly-once，还需要 Sink 支持事务提交、幂等写入或按 batch ID 去重。`foreachBatch` 默认更接近至少一次调用，需要应用使用 `batchId` 设计幂等；普通外部 API 写入不能因为查询有 checkpoint 就自动获得 exactly-once。[S9]
 
@@ -985,47 +1005,47 @@ flowchart TD
     IDEMPOTENT --> RESULT
 ```
 
-### 11.14 幂等写入与事务 Sink
+### 11.15 幂等写入与事务 Sink
 
 幂等写入可以通过业务主键、批次 ID、版本号、MERGE/Upsert 或目标表格式的事务提交实现。设计时要考虑 Task 重试、Batch 重试、Driver 重启、部分写成功和 Sink 超时。对不支持事务的外部系统，应把“写入记录”和“记录已处理批次”设计成可重试且原子或可补偿的流程。
 
-### 11.15 流任务故障恢复
+### 11.16 流任务故障恢复
 
 Driver 重启后，Spark 从 checkpoint 恢复源 offset 和状态；Executor 丢失时，相关 Task/状态分区可以重试或从 checkpoint/上游重建。若 checkpoint 损坏、Source 数据已过保留期、Schema 不兼容或外部 Sink 已产生不可去重的副作用，恢复仍可能失败。恢复演练必须使用真实的存储权限、保留策略和 Sink 行为。
 
-### 11.16 流任务背压与延迟控制
+### 11.17 流任务背压与延迟控制
 
 Structured Streaming 通常通过 Trigger、`maxOffsetsPerTrigger`、文件输入上限、Kafka 每批读取上限、状态和资源配置控制单批数据量。应同时观察输入速率、处理速率、批次持续时间、积压、State Store 和 Sink 延迟。单个查询的微批不会因为缩短 Trigger 间隔而安全并行；如果处理时间超过触发间隔，后续触发会延迟，调度压力和持续积压仍可能增加。
 
-### 11.17 Streaming 监控与运维
+### 11.18 Streaming 监控与运维
 
 重点监控 query 状态、批次 ID、输入行数、处理速率、批次耗时、输入积压、Watermark、State Store 行数/内存、Sink 延迟和异常。对长期运行任务应设置 checkpoint 可写性、Kafka lag、数据新鲜度、状态增长和无进度告警。日志和指标要能关联到 query name、application ID、batch ID。
 
-### 11.18 Trigger：ProcessingTime、Once 与 AvailableNow
+### 11.19 Trigger：ProcessingTime、Once 与 AvailableNow
 
 `ProcessingTime` 按固定时间间隔触发；`Once` 尝试在一个微批中处理当时可见的数据后结束，在 Spark 3.5.x 中已标记为 deprecated，通常应改用 `AvailableNow`；`AvailableNow` 处理启动时可见的全部数据，可以拆成多个批次完成后退出，适合增量回填。Trigger 的支持范围与 Source 版本有关，使用前查目标 Spark 版本文档。[S9]
 
-### 11.19 Stream-Static Join 与 Stream-Stream Join
+### 11.20 Stream-Static Join 与 Stream-Stream Join
 
 Stream-Static Join 使用静态表参与流查询，通常不需要像流流 Join 那样保存两侧历史状态，但静态表的快照和更新可见性必须明确，不能假设历史结果会自动重算。Stream-Stream Join 需要保存两侧历史数据，通常要求时间范围约束和 Watermark 才能清理状态；没有边界的流流 Join 可能导致状态无限增长，且支持的 Join 类型受版本限制。
 
-### 11.20 流式去重与迟到数据处理
+### 11.21 流式去重与迟到数据处理
 
 流式去重按业务唯一键和可选事件时间维护已见记录，Watermark 决定何时可以清理旧键。去重键必须稳定且足以表达业务唯一性；迟到超过边界的数据可能被丢弃，迟到未超过边界的数据可能更新窗口结果。重复消息、重放消息和业务修订消息要分别建模。
 
-### 11.21 foreachBatch 与 foreach
+### 11.22 foreachBatch 与 foreach
 
 `foreachBatch` 把每个微批作为普通 DataFrame 交给用户函数，适合复用批处理 Sink、写多个目标和执行批次级 Upsert；它的调用可能因重试重复，因此应利用 `batchId` 幂等。`foreach` 逐条处理，控制粒度更细但更难获得批量吞吐和事务边界。两者都不会自动让外部副作用具备 exactly-once。
 
-### 11.22 Kafka Offset、startingOffsets 与消费进度
+### 11.23 Kafka Offset、startingOffsets 与消费进度
 
 `startingOffsets` 只在没有可恢复 checkpoint 时决定初始位置；已有 checkpoint 时，恢复通常从 checkpoint 记录的进度继续。Structured Streaming 主要把 offset 进度保存在自己的 checkpoint，不应把它理解成传统 Kafka Consumer Group 已提交 offset。Kafka 的 retention 可能导致 checkpoint 指向的旧数据已不可读，需要设计重置和补数流程。
 
-### 11.23 State Store 状态增长与清理
+### 11.24 State Store 状态增长与清理
 
 状态清理依赖算子语义、事件时间、Watermark、窗口和版本实现。监控状态行数、内存、checkpoint 体积和每批处理时间；必要时降低 Key 基数、增加清理边界、拆分查询或选择合适的 State Store 后端。任意删除状态文件会破坏查询恢复，不应作为常规清理手段。
 
-### 11.24 Structured Streaming 与 DStream 的区别
+### 11.25 Structured Streaming 与 DStream 的区别
 
 DStream 是早期 Spark Streaming 的离散化流 API，以 RDD 和批次间隔为主要抽象；Structured Streaming 基于 DataFrame/Spark SQL，提供事件时间、Watermark、结构化状态和统一查询 API。DStream 仍可能存在于旧系统，但新项目通常优先评估 Structured Streaming，并核对已有 Connector 和 Sink 的迁移差异。
 
@@ -1312,7 +1332,7 @@ Spark 可以作为 Iceberg、Hudi、Delta Lake 等表格式的主要计算引擎
 
 ### 15.5 交互式 SQL 分析
 
-Spark SQL 可以通过 Thrift Server、Notebook、Spark Connect 或平台服务提供交互式查询。交互体验取决于文件布局、元数据、缓存、资源队列和查询并发；它不天然等同于低延迟 OLAP 数据库。
+Spark SQL 可以通过 Thrift Server、Notebook、Spark Connect 或平台服务提供交互式查询。Thrift Server 在 Spark 3.x 中仍受支持，但已处于演进过渡期，Spark 4.x 不再随发行版提供（社区方向是 Spark Connect Server 或外部 HiveServer2），选型时应核对目标 Spark 版本。交互体验取决于文件布局、元数据、缓存、资源队列和查询并发；它不天然等同于低延迟 OLAP 数据库。
 
 ### 15.6 实时数据处理
 
