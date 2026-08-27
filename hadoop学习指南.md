@@ -132,13 +132,19 @@ flowchart TB
         NN_S[Standby NameNode]:::control
         JN[(JournalNode 集群)]:::control
         ZK[(ZooKeeper Ensemble)]:::control
+        ZKFC_A[ZKFC for NameNode A]:::control
+        ZKFC_S[ZKFC for NameNode S]:::control
+        RMElector[RM HA 选主协调器]:::control
         RM_A[Active ResourceManager]:::control
         RM_S[Standby ResourceManager]:::control
         Meta[(Hive Metastore)]:::control
-        ZK --> NN_A
-        ZK --> NN_S
-        ZK --> RM_A
-        ZK --> RM_S
+        NN_A <--> ZKFC_A
+        NN_S <--> ZKFC_S
+        ZKFC_A <--> ZK
+        ZKFC_S <--> ZK
+        RM_A -. 选主 / 故障转移 .-> RMElector
+        RM_S -. 选主 / 故障转移 .-> RMElector
+        RMElector <--> ZK
         NN_A <--> JN
         NN_S <--> JN
     end
@@ -176,6 +182,8 @@ flowchart TB
         Spark[Spark]:::compute
         Flink[Flink]:::compute
         AM[ApplicationMaster / Driver]:::compute
+        KafkaSink[Kafka Consumer / Connect]:::compute
+        HBaseWriter[应用写入 / CDC Consumer]:::compute
         MR --> AM
         Tez --> AM
         Spark --> AM
@@ -191,13 +199,16 @@ flowchart TB
         Online[在线 API / 推荐服务]:::service
     end
 
-    Kafka --> HDFS
+    Kafka --> KafkaSink --> HDFS
     Kafka --> Flink
     APIIn --> HDFS
-    DB --> HBase
-    NN_A -. 心跳 / Block Report .-> DN1
-    NN_A -. 心跳 / Block Report .-> DN2
-    NN_A -. 心跳 / Block Report .-> DN3
+    DB --> HBaseWriter --> HBase
+    DN1 -. 心跳 / Block Report .-> NN_A
+    DN1 -. 心跳 / Block Report .-> NN_S
+    DN2 -. 心跳 / Block Report .-> NN_A
+    DN2 -. 心跳 / Block Report .-> NN_S
+    DN3 -. 心跳 / Block Report .-> NN_A
+    DN3 -. 心跳 / Block Report .-> NN_S
     AM --> C1
     AM --> C2
     AM --> C3
@@ -262,7 +273,22 @@ Hadoop 的配置由多个 XML 文件共同组成。不同发行版可能将配�
 | `capacity-scheduler.xml` | Capacity Scheduler 队列和资源策略 | 队列容量、最大容量、用户限制和抢占 |
 | `workers` | Shell 脚本启动哪些工作节点 | DataNode、NodeManager 等工作节点主机名 |
 
-配置要同时满足“客户端能找到集群”和“各个守护进程使用一致配置”。修改配置后应分批验证，并通过 Web UI、日志和实际读写确认生效；不能只根据 XML 文件中存在某个键就判断配置已经生效。
+配置要同时满足”客户端能找到集群”和”各个守护进程使用一致配置”。修改配置后应分批验证，并通过 Web UI、日志和实际读写确认生效；不能只根据 XML 文件中存在某个键就判断配置已经生效。
+
+常用配置键速查（默认值为常见发行版参考，以实际版本为准）：
+
+| 配置键 | 常见默认值 | 含义 |
+| --- | --- | --- |
+| `fs.defaultFS` | `hdfs://<nameservice>` | 客户端默认访问的文件系统 |
+| `dfs.replication` | `3` | 默认副本因子 |
+| `dfs.blocksize` | `134217728`（128 MB） | Block 大小 |
+| `dfs.namenode.name.dir` | 本机路径 | NameNode 元数据（FsImage/EditLog）目录 |
+| `dfs.datanode.data.dir` | 本机路径 | DataNode 块数据目录 |
+| `dfs.client.read.shortcircuit` | `false` | 本地短路读开关 |
+| `fs.trash.interval` | `0`（不启用） | 回收站保留分钟数 |
+| `yarn.nodemanager.resource.memory-mb` | 按集群规划 | 单节点可分配内存 |
+| `yarn.scheduler.maximum-allocation-mb` | 与 NM 内存匹配 | 单个 Container 内存上限 |
+| `mapreduce.framework.name` | `yarn` | MapReduce 运行框架 |
 
 ---
 
@@ -359,6 +385,16 @@ Block 大小不是“每个文件都固定占用 128 MB”：
 5. 副本节点完成校验后沿 Pipeline 返回确认信息。
 6. 客户端继续申请下一个 Block，直到文件写完并关闭。
 
+数据流内部还有一层粒度：客户端把数据组装成约 64KB 的 Packet（DFSClient 的单个传输单元），Packet 内再按更小的校验单元切分，默认一个 Chunk 为 512 字节数据加 4 字节校验和。完整性校验按 Chunk 进行：写入 Pipeline 时发现校验不一致，通常首先表现为写入失败并进入 Pipeline Recovery；后台扫描（DataBlockScanner）发现已存在的损坏副本后，才会将其标记为坏副本并向 NameNode 报告，随后可能触发重新复制。理解「文件 -> Block -> Packet -> Chunk」这层粒度关系，才真正说清 HDFS 的校验与坏块机制。
+
+#### 写管道中途 DataNode 故障（Pipeline Recovery）
+
+- 客户端在写某个 Packet 时收到 ACK 超时或管道中断，会关闭当前管道并移除故障 DataNode；健康的下游节点是否保留，取决于故障位置、ACK 状态和各副本已经确认的数据长度，不能一概而论。
+- Pipeline Recovery 会根据各副本状态将未完成 Block 恢复到共同有效长度，重建由健康节点组成的 Pipeline，再继续写入；未确认或不一致的数据不能直接当作完整 Block 的有效内容。
+- 如果收尾后副本数低于复制因子，NameNode 会基于后续心跳和 Block Report 发现副本不足，触发后台复制补齐。
+- 若客户端自身也崩溃无法收尾，则由租约恢复（Lease Recovery）接管：NameNode 协调出一个授权节点，对未完成 Block 做探测性收尾。
+- 与读侧“副本切换”互补：读侧应对“读不到”，写侧应对“写不动”，两者共同构成 HDFS 端到端容错。
+
 可用 Mermaid 表示一次典型的 HDFS 写入：
 
 ```mermaid
@@ -427,11 +463,13 @@ sequenceDiagram
 
 Hadoop 的数据本地性包含三个常见层级：
 
-1. Node Local：任务运行在保存目标 Block 的节点上。
-2. Rack Local：任务运行在同机架但不同节点上。
-3. Off Rack：需要跨机架读取。
+1. NODE_LOCAL：任务运行在保存目标 Block 的节点上。
+2. RACK_LOCAL：任务运行在同机架但不同节点上。
+3. OFF_SWITCH：需要跨机架读取，也常被描述为跨机架或非本地读取。
 
 数据本地性不是强制保证。如果本地节点资源不足、任务等待超过调度器阈值，系统可能牺牲本地性来尽快启动任务。数据本地性可以减少网络传输，但不能简单理解为“任务一定在数据所在机器执行”。
+
+延迟调度（Delay Scheduling）：当任务无法在本地或同机架节点获得资源时，调度器不是立刻把它分配到远处节点，而是让任务在调度队列中等待若干心跳周期，期望本地或同机架资源尽快释放；超过等待阈值后才放弃本地性，避免任务无限等待。这是「数据本地性」与「调度延迟」之间的核心取舍，在 YARN 调度器（如 Capacity Scheduler 的延迟调度）与 Spark 的延迟调度中都有体现。
 
 ### 3.5 副本放置的典型策略
 
@@ -1080,6 +1118,30 @@ Hive 分区的主要价值是减少扫描数据量。常见分区字段有日期
 
 分层不是为了增加目录数量，而是为了明确数据责任、复用公共逻辑、降低重复计算，并支持问题追溯。
 
+### 7.6 维度建模
+
+- 核心对象：事实表与维度表。事实表保存可度量的事实（订单金额、数量、次数），维度表提供描述性属性（用户、商品、日期、渠道）用于筛选和分组。
+- 常见建模形式：
+  - 星型模型：事实表居中，维度表围绕在事实表旁，查询 Join 简单，是离线数仓最常用的形式。
+  - 雪花模型：维度表再拆分出关联表，减少冗余但增加 Join 层级，一般因复杂度而较少优先。
+  - 事实星座（Fact Constellation）：多个事实表共享维度总线，对应多主题的数仓。
+- 事实表类型：事务型（一笔一笔记录，如订单明细）、周期快照型（周期性汇总，如每日库存）、累积快照型（跨生命周期聚合，如订单从下单到完成的各阶段）。
+- 维度建模要点：
+  - 代理键：用与源系统无关的自增键标识维度行，屏蔽源系统主键变更。
+  - 缓慢变化维（SCD）：Type 1 直接覆盖、Type 2 保留历史版本（即拉链表）、Type 3 保留当前值与上一值；实际项目先用 Type 2 的拉链表居多。
+  - 退化维度：订单号、交易流水号等直接放事实表，不单独建维表。
+  - 声明粒度：建事实表前先明确“一行代表什么”，这是事实表设计最核心的一步。
+- 实用权衡：宽表减少 Join 但增加冗余和刷宽成本；应结合查询频率、更新方式、下游使用习惯决定大宽表还是星型明细。
+
+### 7.7 数据治理与数据质量
+
+- 数据质量维度：完整性、准确性、一致性、及时性、唯一性。常见表现包括字段缺失、单位不一致、重复记录、延迟到达、口径打架。
+- DQC 落地检查：空值率、枚举值合法性与范围、主键/唯一性、按转换规则校验源、目标行数关系并进行业务对账、分区完整性检查（无遗漏、无重叠）、时间字段合理性；任务级检查分区是否到达、行数是否符合预期、失败重跑后有无半成品。
+- 血缘：记录表、字段、任务之间的上下游关系，用于回答“这个指标来自哪张表、哪个任务”（Atlas、DataHub 等工具或自建解析）。
+- 指标口径管理：建立指标字典，统一指标名称、口径、计算逻辑、更新频率和负责人，避免同一指标多处不同口径。
+- 生命周期管理：明细保留期限、归档策略、TTL 清理与历史版本保留，与第 8 章快照/备份衔接。
+- 规范与流程：命名规范（表名、字段名、分区目录）、目录规划、建表变更审批、上线质量门禁。
+
 ---
 
 ## 8. 高可用、容错与安全
@@ -1097,17 +1159,21 @@ Hive 分区的主要价值是减少扫描数据量。常见分区字段有日期
 
 ```mermaid
 flowchart LR
-    C[HDFS Client] --> A[Active NameNode]
-    C -. 失败后重连 .-> S[Standby NameNode]
+    C[HDFS Client] --> NS[HDFS Logical Nameservice]
+    NS --> A[Active NameNode]
+    NS -. 故障转移后定位新的 Active .-> S[Standby NameNode]
     A --> J1[JournalNode 1]
     A --> J2[JournalNode 2]
     A --> J3[JournalNode 3]
     S --> J1
     S --> J2
     S --> J3
-    A --> Z[ZooKeeper Ensemble]
-    S --> Z
-    Z --> F[ZKFC / 自动故障转移]
+    ZKA[ZKFC for NameNode A]
+    ZKS[ZKFC for NameNode S]
+    A <--> ZKA
+    S <--> ZKS
+    ZKA <--> Z[ZooKeeper Ensemble]
+    ZKS <--> Z
     D1[DataNode 1] --> A
     D1 --> S
     D2[DataNode 2] --> A
@@ -1116,16 +1182,23 @@ flowchart LR
 
 要点：
 
-- JournalNode 通常需要奇数个节点，依靠多数派写入保证日志可靠性。
+- JournalNode 通常建议部署 3 个或更多奇数个节点，依靠多数派写入保证日志可靠性；关键不是“奇数”本身，而是必须满足可用多数派。
 - Standby 不是简单复制一份 NameNode 进程，而是持续同步命名空间和编辑日志。
 - 自动故障转移需要防止脑裂，通常依赖 fencing 机制。
 - HA 不等于灾备。机房级故障还需要异地复制、对象存储、DistCp 或其他备份方案。
 
 ### 8.2 NameNode Federation
 
-Federation 通过多个独立 NameNode 管理不同命名空间或命名空间卷，使元数据压力和命名空间规模可以横向扩展。Router-based Federation 可以提供统一访问入口。
+Federation 通过多个相互独立的 NameNode 管理互不重叠的命名空间，把元数据压力从单个 NameNode 分摊出去，使命名空间规模和 RPC 能力可以横向扩展。
 
-HA 关注“一个命名空间的主备切换”；Federation 关注“多个命名空间分摊元数据压力”，二者可以组合使用。
+核心概念：
+
+- Namespace 与 Block Pool：每个 Federation NameNode 管理自己的命名空间，并对应一个独立的 Block Pool（该命名空间内文件切分出的 Block 集合）。同一个 DataNode 可以同时为多个 Block Pool 存储 Block，因此 Federation 下会共享同一批 DataNode 节点。
+- 统一访问入口：ViewFS 使用客户端侧挂载表把多个 nameservice 挂载到同一棵目录树，因此各客户端仍需要分发一致的挂载配置；Router-based Federation 则由 Router 层做路由与代理，可通过集中式路由配置减少客户端分别维护多个 nameservice 入口的负担。
+- 与多套独立集群的区别：Federation 的多个 NameNode 共享同一批 DataNode 和 YARN 资源，属于「一套集群内的扩展」；多套独立集群则是存储、元数据、资源、运维完全隔离的多份部署。前者解决单个 NameNode 的瓶颈，后者解决故障域、租户隔离与独立性。
+- 要注意：Federation 下文件仍属于单个命名空间，跨命名空间的原子 rename 通常不支持；命名空间之间的数据复制要依靠 DistCp 等外部工具。
+
+HA 关注”一个命名空间的主备切换”；Federation 关注”多个命名空间分摊元数据压力”，二者可以组合使用：每个 Federation NameNode 又可各自做 Active/Standby，形成「横向扩展 + 高可用」。
 
 ### 8.3 Erasure Coding
 
@@ -1187,6 +1260,7 @@ HDFS 对数据块和传输过程使用校验和。读取时发现校验失败，
 - 检查磁盘类型、坏盘、磁盘利用率和 DataNode 目录均衡。
 - 通过副本数量、纠删码和冷热分层平衡可靠性与成本。
 - 确保 NameNode 堆内存与命名空间规模匹配，并观察 GC 停顿。
+- 开启 Short Circuit Read（本地短路读）：计算进程直接读取本地磁盘上的 Block，绕过 DataNode 的 RPC 与传输路径，降低读延迟和 DataNode 负载；需配置 `dfs.client.read.shortcircuit=true` 和 `dfs.domain.socket.path`，并确认仅对与数据同节点的进程生效。
 
 ### 9.3 YARN 层调优
 
@@ -1208,7 +1282,7 @@ HDFS 对数据块和传输过程使用校验和。读取时发现校验失败，
 - 对小表使用 Map-side Join 或广播，减少大规模 Shuffle。
 - 谨慎处理推测执行和失败重试，避免外部副作用。
 
-### 9.5 Hive/Spark SQL 层调优
+### 9.5 Hive SQL 层调优
 
 - 只选择需要的列，避免 `SELECT *`。
 - 尽早过滤分区和数据，利用分区裁剪、谓词下推。
@@ -1220,7 +1294,17 @@ HDFS 对数据块和传输过程使用校验和。读取时发现校验失败，
 - 避免在循环中反复读取同一批数据。
 - 检查执行计划，不要只根据 SQL 表面写法判断性能。
 
-### 9.6 常见反模式
+### 9.6 Spark 作业调优
+
+- 开启自适应执行（AQE）：动态合并 Shuffle 分区、动态切换 Join 策略（Broadcast/SortMerge）、自动切分倾斜分区；Apache Spark 3.2 及之后版本通常默认开启，Spark 3.0/3.1 或发行版配置可能需要显式启用。
+- 控制 Executor 与并行度：合理设置 executor 内存/核数和 `spark.sql.shuffle.partitions`（默认 200，需按数据量和核数调整），避免分区过大或小任务过多。
+- Join 优化：小表与大表 Join 优先依赖 AQE 与广播阈值；显式指定可用 `/*+ BROADCAST(t) */` 提示，但要通过执行计划确认最终是否广播。
+- 复用与缓存：对反复使用的中间数据集评估 `cache`/`checkpoint`，注意缓存占用与序列化开销；避免同一批数据在多轮作业中重复读取。
+- 控制 Shuffle 与文件数：`coalesce` 用于减少分区、`repartition` 用于增大并行，两者的重分区语义不同；OOM 定位要区分堆内/堆外和 Executor 内存模型。
+- 与数据格式联动：确认列裁剪、分区裁剪、谓词下推真正落到文件扫描层（看 Spark UI 的 SQL 计划），列式格式无效时先从格式和分区找原因。
+- 与前面章节呼应：Spark on YARN 的队列、Container 资源、数据本地性与延迟调度，复用第 4 章与 9.3 节的分析思路。
+
+### 9.7 常见反模式
 
 - 把大量几 KB 的文件直接写入 HDFS。
 - 用高副本数解决所有可靠性问题。
@@ -1231,7 +1315,7 @@ HDFS 对数据块和传输过程使用校验和。读取时发现校验失败，
 - 在高峰期频繁重跑同一大作业，放大集群拥塞。
 - 只看平均任务耗时，不看长尾任务和数据分布。
 
-### 9.7 监控指标
+### 9.8 监控指标
 
 建议至少关注：
 
@@ -1281,6 +1365,9 @@ hdfs dfs -rm -r -skipTrash /tmp/result
 hdfs dfs -chmod -R 750 /data/ods/events
 hdfs dfs -setrep -w 3 /data/ods/events/dt=2026-08-27/events.json
 
+# 追加小段数据（Hadoop 2.x+ 支持 append）
+hdfs dfs -appendToFile local_events.log /data/ods/events/dt=2026-08-27/events.log
+
 # 查看文件状态和 Block 位置
 hdfs fsck /data/ods/events/dt=2026-08-27/events.json -files -blocks -locations
 ```
@@ -1300,7 +1387,34 @@ hdfs dfs -cat /data/output/wordcount_20260827/part-r-00000 | head
 
 输出目录通常不能预先存在，否则作业可能失败。生产作业应使用带批次或版本的临时目录，成功后再原子切换或登记分区，避免下游读到半成品。
 
-### 10.3 Hive 分区表示例
+### 10.3 YARN 应用与日志命令
+
+```bash
+# 查看所有应用及状态
+yarn application -list
+
+# 查看单个应用详情（提交时间、AM 状态、进度、资源、队列）
+yarn application -status <applicationId>
+
+# 终止应用（先用 -status 确认归属和影响范围）
+yarn application -kill <applicationId>
+
+# 查看应用日志（依赖日志聚合配置）
+yarn logs -applicationId <applicationId>
+
+# 查看节点与资源状态
+yarn node -list -all
+
+# 查看队列容量与使用情况
+yarn queue -status <queueName>
+
+# HA 环境确认当前 Active ResourceManager
+yarn rmadmin -getAllServiceState
+```
+
+`yarn application -status` 是排查「应用长期 ACCEPTED」的第一步，需结合 4.5 节的队列、资源与节点检查逐项确认；`yarn logs` 能看到的日志完整度取决于日志聚合（`yarn.log-aggregation-enable`）是否开启，未开启时需到对应 NodeManager 的本地 `logs/userlogs` 目录查看。
+
+### 10.4 Hive 分区表示例
 
 ```sql
 CREATE DATABASE IF NOT EXISTS demo;
@@ -1328,7 +1442,49 @@ GROUP BY event_type;
 
 注意：分区目录已经写入文件，不代表 Hive 一定自动知道分区。可以显式 `ALTER TABLE ADD PARTITION`，或使用 `MSCK REPAIR TABLE` 扫描目录；大规模频繁分区场景需要评估元数据操作成本。
 
-### 10.4 DistCp 跨集群复制
+#### 常用 SQL 模式示例（数据开发日常）
+
+```sql
+-- 1) 去重取最新：窗口函数按 user_id 取最新一条
+SELECT *
+FROM (
+  SELECT *,
+         ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY event_time DESC) AS rn
+  FROM dwd.detail_events
+) t
+WHERE rn = 1;
+
+-- 2) 拉链表口径：取当前有效版本
+SELECT user_id, status, eff_date, end_date
+FROM dwd.user_dim
+WHERE eff_date <= '2026-08-27' AND end_date >= '2026-08-27';
+
+-- 3) 数据倾斜：热点 Key 加盐两阶段聚合
+SELECT dt, SUM(cnt) AS total
+FROM (
+  SELECT dt, salt_key, SUM(amount) AS cnt
+  FROM (
+    SELECT dt, amount,
+           CASE WHEN user_id IN ('hot_user_a', 'hot_user_b')
+                THEN CONCAT('salt_', CAST(RAND() * 8 AS INT), '_', user_id)
+                ELSE 'normal' END AS salt_key
+    FROM dwd.order_detail
+  ) a
+  GROUP BY dt, salt_key
+) b
+GROUP BY dt;
+
+-- 4) 小表广播 Join
+SELECT /*+ MAPJOIN(dim) */ f.*, dim.dim_name
+FROM dwd.order_detail f
+JOIN dwd.dim dim ON f.dim_id = dim.id;
+```
+
+- 窗口函数（`ROW_NUMBER`/`RANK`、`LAG`/`LEAD`、`SUM() OVER`）是去重、增量合并、环比同比最常用的实现，日常和面试都高频。
+- 拉链表的核心就是"`eff_date <= 当日 AND end_date >= 当日`"取当前有效行；示例是简化写法，实际拉链更新还涉及对旧版本 `end_date` 的收口。
+- 倾斜示例是"问题 -> 方案"的最小演示：先按分组统计找出热点 Key，再加盐两阶段聚合；引擎端 AQE/倾斜处理可做兜底。
+
+### 10.5 DistCp 跨集群复制
 
 ```bash
 hadoop distcp \
@@ -1340,7 +1496,37 @@ hadoop distcp \
 
 `-update` 和 `-delete` 会影响目标端文件，使用前必须确认源和目标路径。复制前应验证权限、加密区、带宽、快照策略和失败重试行为。
 
-### 10.5 一次完整的离线数据链路
+### 10.6 HDFS 运维命令：快照、下线与回收站
+
+```bash
+# 开启目录快照并创建
+hdfs dfsadmin -allowSnapshot /data/ods
+hdfs dfs -createSnapshot /data/ods ods_20260827
+hdfs dfs -listSnapshottableDir
+
+# 通过 .snapshot 路径访问和恢复被误删的目录
+hdfs dfs -ls /data/ods/.snapshot/ods_20260827
+hdfs dfs -cp /data/ods/.snapshot/ods_20260827/lost_dir /data/ods/
+
+# 节点下线：将主机加入 dfs.hosts.exclude 后刷新
+hdfs dfsadmin -refreshNodes
+hdfs dfsadmin -report   # 观察 Decommissioned 状态与副本迁移进度
+
+# 回收站保留时长（core-site.xml 配置键，分钟制）
+# fs.trash.interval=1440
+
+# 纠删码策略启用与目录应用（Hadoop 3.x，策略需集群未关闭）
+hdfs ec -enablePolicy -policy RS-6-3-1024k
+hdfs ec -setPolicy -path /data/cold -policy RS-6-3-1024k
+```
+
+要点：
+
+- 快照需先在目标目录执行 `-allowSnapshot` 才能创建，目录下通过 `/目录/.snapshot/快照名` 路径访问只读快照视图。
+- 节点下线前把主机加入 `dfs.hosts.exclude` 并执行 `-refreshNodes`，等 Block 迁移完成、状态变为 Decommissioned 后再停机或移除；未确认状态就关机会造成副本不足和复制风暴。
+- 回收站由 `fs.trash.interval` 控制（0 表示不启用）；`-rm` 默认进回收站，`-rm -skipTrash` 才会立即删除，批量删除前务必确认路径范围。
+
+### 10.7 一次完整的离线数据链路
 
 以“每日用户行为报表”为例：
 
@@ -1354,7 +1540,7 @@ hadoop distcp \
 
 这条链路的关键不只是“作业跑成功”，还包括可重跑、幂等、数据质量、血缘、监控、告警和回滚。
 
-### 10.6 幂等与可重跑设计
+### 10.8 幂等与可重跑设计
 
 离线任务建议遵循：
 
